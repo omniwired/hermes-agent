@@ -23,6 +23,26 @@ def _get_minimax_cn_api_key() -> str:
     return get_env_value("MINIMAX_CN_API_KEY") or ""
 
 
+def _is_standard_key(api_key: str) -> bool:
+    """Check if key is a standard MiniMax key (sk-api-*).
+
+    Standard keys are tied to web sessions and do NOT work with the direct API.
+    Only coding plan keys (sk-cp-*) or service keys work with /v1/coding_plan/remains.
+    """
+    return api_key.startswith("sk-api-")
+
+
+def _detect_key_kind(api_key: str) -> str:
+    """Detect the type of MiniMax API key."""
+    if api_key.startswith("sk-cp-"):
+        return "coding_plan"
+    elif api_key.startswith("sk-api-"):
+        return "standard"
+    elif api_key.startswith("sk-"):
+        return "service"
+    return "unknown"
+
+
 def check_minimax_quota_requirements() -> bool:
     """Check if MiniMax API key is configured (either global or China)."""
     return bool(_get_minimax_api_key() or _get_minimax_cn_api_key())
@@ -74,32 +94,53 @@ def minimax_quota_tool(provider: str = "auto") -> str:
     Returns:
         JSON string with quota details or error message.
     """
+    def _check_and_fetch(api_key: str, base_url: str, provider_label: str) -> str | None:
+        """Check key type and fetch quota. Returns None on error, error JSON on failure."""
+        key_kind = _detect_key_kind(api_key)
+        if key_kind == "standard":
+            return json.dumps({
+                "error": (
+                    "Standard MiniMax API keys (sk-api-*) do not work with the quota API endpoint. "
+                    "You need a coding plan key (sk-cp-*) or service key. "
+                    "See: https://platform.minimax.io/user-center/payment/coding-plan"
+                ),
+                "key_kind": "standard",
+            })
+        if key_kind == "unknown":
+            return json.dumps({
+                "error": (
+                    "Unrecognized MiniMax API key format. "
+                    "This tool requires a coding plan key (sk-cp-*) or service key."
+                ),
+                "key_kind": "unknown",
+            })
+        try:
+            data = _fetch_quota(api_key, base_url)
+            return json.dumps({
+                "provider": provider_label,
+                "data": data,
+                "formatted": _format_quota_response(data, provider_label),
+            })
+        except Exception as e:
+            logger.warning("Failed to fetch %s quota: %s", provider_label, e)
+            return None
+
     if provider == "auto":
         # Try global first, then China
         api_key = _get_minimax_api_key()
         if api_key:
-            try:
-                data = _fetch_quota(api_key, MINIMAX_QUOTA_URL)
-                return json.dumps({
-                    "provider": "minimax",
-                    "data": data,
-                    "formatted": _format_quota_response(data, "MiniMax (Global)"),
-                })
-            except Exception as e:
-                logger.warning("Failed to fetch MiniMax global quota: %s", e)
+            result = _check_and_fetch(api_key, MINIMAX_QUOTA_URL, "MiniMax (Global)")
+            if result:
+                return result
+            # If result is None, API failed - try China as fallback
 
         # Fall back to China
         api_key = _get_minimax_cn_api_key()
         if api_key:
-            try:
-                data = _fetch_quota(api_key, MINIMAX_CN_QUOTA_URL)
-                return json.dumps({
-                    "provider": "minimax-cn",
-                    "data": data,
-                    "formatted": _format_quota_response(data, "MiniMax (China)"),
-                })
-            except Exception as e:
-                return json.dumps({"error": f"Failed to fetch MiniMax CN quota: {e}"})
+            result = _check_and_fetch(api_key, MINIMAX_CN_QUOTA_URL, "MiniMax (China)")
+            if result:
+                return result
+            return json.dumps({"error": f"Failed to fetch MiniMax CN quota"})
 
         return json.dumps({"error": "No MiniMax API key configured. Set MINIMAX_API_KEY or MINIMAX_CN_API_KEY."})
 
@@ -107,29 +148,15 @@ def minimax_quota_tool(provider: str = "auto") -> str:
         api_key = _get_minimax_api_key()
         if not api_key:
             return json.dumps({"error": "MINIMAX_API_KEY not configured"})
-        try:
-            data = _fetch_quota(api_key, MINIMAX_QUOTA_URL)
-            return json.dumps({
-                "provider": "minimax",
-                "data": data,
-                "formatted": _format_quota_response(data, "MiniMax (Global)"),
-            })
-        except Exception as e:
-            return json.dumps({"error": f"Failed to fetch quota: {e}"})
+        result = _check_and_fetch(api_key, MINIMAX_QUOTA_URL, "MiniMax (Global)")
+        return result or json.dumps({"error": "Failed to fetch MiniMax quota"})
 
     elif provider == "minimax-cn":
         api_key = _get_minimax_cn_api_key()
         if not api_key:
             return json.dumps({"error": "MINIMAX_CN_API_KEY not configured"})
-        try:
-            data = _fetch_quota(api_key, MINIMAX_CN_QUOTA_URL)
-            return json.dumps({
-                "provider": "minimax-cn",
-                "data": data,
-                "formatted": _format_quota_response(data, "MiniMax (China)"),
-            })
-        except Exception as e:
-            return json.dumps({"error": f"Failed to fetch quota: {e}"})
+        result = _check_and_fetch(api_key, MINIMAX_CN_QUOTA_URL, "MiniMax (China)")
+        return result or json.dumps({"error": "Failed to fetch MiniMax CN quota"})
 
     return json.dumps({"error": f"Unknown provider: {provider}. Use 'minimax', 'minimax-cn', or 'auto'."})
 
