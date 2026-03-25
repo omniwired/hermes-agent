@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 import requests
 
 logger = logging.getLogger(__name__)
@@ -12,9 +11,21 @@ MINIMAX_QUOTA_URL = "https://api.minimax.io/v1/coding_plan/remains"
 MINIMAX_CN_QUOTA_URL = "https://api.minimaxi.com/v1/coding_plan/remains"
 
 
+def _get_minimax_api_key() -> str:
+    """Get MiniMax API key from hermes secret storage (env vars or ~/.hermes/.env)."""
+    from hermes_cli.config import get_env_value
+    return get_env_value("MINIMAX_API_KEY") or ""
+
+
+def _get_minimax_cn_api_key() -> str:
+    """Get MiniMax China API key from hermes secret storage (env vars or ~/.hermes/.env)."""
+    from hermes_cli.config import get_env_value
+    return get_env_value("MINIMAX_CN_API_KEY") or ""
+
+
 def check_minimax_quota_requirements() -> bool:
     """Check if MiniMax API key is configured (either global or China)."""
-    return bool(os.getenv("MINIMAX_API_KEY") or os.getenv("MINIMAX_CN_API_KEY"))
+    return bool(_get_minimax_api_key() or _get_minimax_cn_api_key())
 
 
 def _fetch_quota(api_key: str, base_url: str) -> dict:
@@ -65,7 +76,7 @@ def minimax_quota_tool(provider: str = "auto") -> str:
     """
     if provider == "auto":
         # Try global first, then China
-        api_key = os.getenv("MINIMAX_API_KEY", "")
+        api_key = _get_minimax_api_key()
         if api_key:
             try:
                 data = _fetch_quota(api_key, MINIMAX_QUOTA_URL)
@@ -78,7 +89,7 @@ def minimax_quota_tool(provider: str = "auto") -> str:
                 logger.warning("Failed to fetch MiniMax global quota: %s", e)
 
         # Fall back to China
-        api_key = os.getenv("MINIMAX_CN_API_KEY", "")
+        api_key = _get_minimax_cn_api_key()
         if api_key:
             try:
                 data = _fetch_quota(api_key, MINIMAX_CN_QUOTA_URL)
@@ -93,7 +104,7 @@ def minimax_quota_tool(provider: str = "auto") -> str:
         return json.dumps({"error": "No MiniMax API key configured. Set MINIMAX_API_KEY or MINIMAX_CN_API_KEY."})
 
     elif provider == "minimax":
-        api_key = os.getenv("MINIMAX_API_KEY", "")
+        api_key = _get_minimax_api_key()
         if not api_key:
             return json.dumps({"error": "MINIMAX_API_KEY not configured"})
         try:
@@ -107,7 +118,7 @@ def minimax_quota_tool(provider: str = "auto") -> str:
             return json.dumps({"error": f"Failed to fetch quota: {e}"})
 
     elif provider == "minimax-cn":
-        api_key = os.getenv("MINIMAX_CN_API_KEY", "")
+        api_key = _get_minimax_cn_api_key()
         if not api_key:
             return json.dumps({"error": "MINIMAX_CN_API_KEY not configured"})
         try:
