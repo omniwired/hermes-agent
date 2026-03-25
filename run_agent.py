@@ -419,6 +419,8 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        memory_dir: Path | None = None,
+        workspace: str | None = None,
     ):
         """
         Initialize the AI Agent.
@@ -462,6 +464,12 @@ class AIAgent:
                 When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
             honcho_manager: Optional shared HonchoSessionManager owned by the caller.
             honcho_config: Optional HonchoClientConfig corresponding to honcho_manager.
+            memory_dir (Path): Custom directory for memory files (MEMORY.md, USER.md).
+                When set, MemoryStore uses this path instead of $HERMES_HOME/memories/.
+                Takes precedence over workspace when both are set.
+            workspace (str): Workspace name for this agent. Maps to
+                $HERMES_HOME/workspaces/{workspace}/memories/. When set, enables
+                per-agent/per-project memory isolation. Mutually exclusive with memory_dir.
         """
         _install_safe_stdio()
 
@@ -900,6 +908,16 @@ class AIAgent:
         except Exception:
             _agent_cfg = {}
 
+        # Resolve per-agent memory directory from workspace or explicit parameter
+        # Must be set before the MemoryStore initialization below.
+        if memory_dir is not None:
+            self._memory_dir: Path | None = memory_dir
+        elif workspace is not None:
+            hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+            self._memory_dir = hermes_home / "workspaces" / workspace / "memories"
+        else:
+            self._memory_dir = None
+
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -920,6 +938,7 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_dir=self._memory_dir,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -950,7 +969,7 @@ class AIAgent:
                     self._honcho_config = hcfg
                     if self._honcho_should_activate(hcfg):
                         from honcho_integration.session import HonchoSessionManager
-                        client = get_honcho_client(hcfg)
+                        client = get_honcho_client(hcfg, workspace_id=workspace)
                         self._honcho = HonchoSessionManager(
                             honcho=client,
                             config=hcfg,

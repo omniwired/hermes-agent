@@ -369,19 +369,21 @@ class HonchoClientConfig:
 
 
 _honcho_client: Honcho | None = None
+# Cache keyed by (base_url_or_host, workspace_id) for per-workspace client isolation
+_honcho_client_cache: dict[tuple[str, str], Honcho] = {}
 
 
-def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
-    """Get or create the Honcho client singleton.
+def get_honcho_client(config: HonchoClientConfig | None = None,
+                      workspace_id: str | None = None) -> Honcho:
+    """Get or create a Honcho client.
 
     When no config is provided, attempts to load ~/.honcho/config.json
     first, falling back to environment variables.
+
+    When workspace_id is provided, the client is created for that specific
+    workspace, enabling per-agent workspace isolation. Clients are cached
+    by (base_url, workspace_id) tuple.
     """
-    global _honcho_client
-
-    if _honcho_client is not None:
-        return _honcho_client
-
     if config is None:
         config = HonchoClientConfig.from_global_config()
 
@@ -415,25 +417,34 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         except Exception:
             pass
 
+    # Use agent's workspace_id if provided, otherwise fall back to config's default
+    effective_workspace = workspace_id or config.workspace_id or "default"
+    effective_base = resolved_base_url or config.host or ""
+
+    cache_key = (effective_base, effective_workspace)
+    if cache_key in _honcho_client_cache:
+        return _honcho_client_cache[cache_key]
+
     if resolved_base_url:
-        logger.info("Initializing Honcho client (base_url: %s, workspace: %s)", resolved_base_url, config.workspace_id)
+        logger.info("Initializing Honcho client (base_url: %s, workspace: %s)", resolved_base_url, effective_workspace)
     else:
-        logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, config.workspace_id)
+        logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, effective_workspace)
 
     kwargs: dict = {
-        "workspace_id": config.workspace_id,
+        "workspace_id": effective_workspace,
         "api_key": config.api_key,
         "environment": config.environment,
     }
     if resolved_base_url:
         kwargs["base_url"] = resolved_base_url
 
-    _honcho_client = Honcho(**kwargs)
-
-    return _honcho_client
+    client = Honcho(**kwargs)
+    _honcho_client_cache[cache_key] = client
+    return client
 
 
 def reset_honcho_client() -> None:
-    """Reset the Honcho client singleton (useful for testing)."""
-    global _honcho_client
+    """Reset the Honcho client cache (useful for testing)."""
+    global _honcho_client, _honcho_client_cache
     _honcho_client = None
+    _honcho_client_cache.clear()
