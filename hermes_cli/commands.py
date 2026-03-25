@@ -129,6 +129,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
                gateway_only=True),
+    CommandDef("quota", "Show MiniMax API quota and usage", "Info",
+               gateway_only=True, aliases=("minimax",)),
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",

@@ -1723,6 +1723,9 @@ class GatewayRunner:
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "quota":
+            return await self._handle_quota_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
@@ -4195,6 +4198,19 @@ class GatewayRunner:
         except Exception as e:
             logger.error("Insights command error: %s", e, exc_info=True)
             return f"Error generating insights: {e}"
+
+    async def _handle_quota_command(self, event: MessageEvent) -> str:
+        """Handle /quota command -- show MiniMax API quota status."""
+        import json
+        from tools.minimax_quota_tool import minimax_quota_tool
+
+        result = minimax_quota_tool(provider="auto")
+        data = json.loads(result)
+
+        if "error" in data:
+            return f"Error: {data['error']}"
+
+        return data.get("formatted", str(data))
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""

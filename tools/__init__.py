@@ -154,6 +154,12 @@ from .delegate_tool import (
     DELEGATE_TASK_SCHEMA,
 )
 
+# MiniMax quota tool (API usage monitoring)
+from .minimax_quota_tool import (
+    minimax_quota_tool,
+    check_minimax_quota_requirements,
+)
+
 # File tools have no external requirements - they use the terminal backend
 def check_file_requirements():
     """File tools only require terminal backend to be available."""
@@ -258,5 +264,8 @@ __all__ = [
     'delegate_task',
     'check_delegate_requirements',
     'DELEGATE_TASK_SCHEMA',
+    # MiniMax quota
+    'minimax_quota_tool',
+    'check_minimax_quota_requirements',
 ]
 
