@@ -6,9 +6,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Endpoints
-MINIMAX_QUOTA_URL = "https://api.minimax.io/v1/coding_plan/remains"
-MINIMAX_CN_QUOTA_URL = "https://api.minimaxi.com/v1/coding_plan/remains"
+# Endpoints (from CodexBar MiniMaxAPIRegion.swift)
+MINIMAX_QUOTA_URL = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains"
+MINIMAX_CN_QUOTA_URL = "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains"
 
 
 def _get_minimax_api_key() -> str:
@@ -61,24 +61,47 @@ def _fetch_quota(api_key: str, base_url: str) -> dict:
 
 def _format_quota_response(data: dict, provider_label: str) -> str:
     """Format quota data for display."""
-    total = data.get("current_interval_total_count", 0)
-    used = data.get("current_interval_usage_count", 0)
-    remaining = total - used
-    start = data.get("start_time", "unknown")
-    end = data.get("end_time", "unknown")
+    # Response is model_remains array (from CodexBar MiniMaxUsageParser)
+    model_remains = data.get("model_remains", [])
 
-    # Calculate percentage
-    pct = (used / total * 100) if total > 0 else 0
+    if not model_remains:
+        return f"  {provider_label} Quota\n  No quota data available."
 
     lines = [
         f"  {provider_label} Quota",
-        f"  {'─' * 40}",
-        f"  Total:     {total:,}",
-        f"  Used:      {used:,} ({pct:.1f}%)",
-        f"  Remaining: {remaining:,}",
-        f"  Period:    {start} → {end}",
+        f"  {'─' * 50}",
     ]
+
+    for entry in model_remains:
+        model_name = entry.get("model_name", "Unknown")
+        total = entry.get("current_interval_total_count", 0)
+        used = entry.get("current_interval_usage_count", 0)
+        remaining = total - used
+        pct = (used / total * 100) if total > 0 else 0
+
+        # Timestamps are in milliseconds
+        start_ms = entry.get("start_time", 0)
+        end_ms = entry.get("end_time", 0)
+        start = _format_timestamp(start_ms)
+        end = _format_timestamp(end_ms)
+
+        lines.append(f"  {model_name}:")
+        lines.append(f"    Total:     {total:,}")
+        lines.append(f"    Used:      {used:,} ({pct:.1f}%)")
+        lines.append(f"    Remaining: {remaining:,}")
+        lines.append(f"    Period:    {start} → {end}")
+
     return "\n".join(lines)
+
+
+def _format_timestamp(ms: int) -> str:
+    """Format millisecond timestamp to readable string."""
+    if not ms:
+        return "unknown"
+    from datetime import datetime, timezone, timedelta
+    # Timestamps are in milliseconds UTC
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return dt.strftime("%m/%d %H:%M UTC")
 
 
 def minimax_quota_tool(provider: str = "auto") -> str:
@@ -97,6 +120,7 @@ def minimax_quota_tool(provider: str = "auto") -> str:
     def _check_and_fetch(api_key: str, base_url: str, provider_label: str) -> str | None:
         """Check key type and fetch quota. Returns None on error, error JSON on failure."""
         key_kind = _detect_key_kind(api_key)
+        # Only standard keys (sk-api-*) skip the API - they require web path
         if key_kind == "standard":
             return json.dumps({
                 "error": (
@@ -106,14 +130,7 @@ def minimax_quota_tool(provider: str = "auto") -> str:
                 ),
                 "key_kind": "standard",
             })
-        if key_kind == "unknown":
-            return json.dumps({
-                "error": (
-                    "Unrecognized MiniMax API key format. "
-                    "This tool requires a coding plan key (sk-cp-*) or service key."
-                ),
-                "key_kind": "unknown",
-            })
+        # All other key types (coding_plan, service, unknown/JWT) try the API
         try:
             data = _fetch_quota(api_key, base_url)
             return json.dumps({
