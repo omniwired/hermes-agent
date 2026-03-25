@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -160,6 +161,9 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    # Workspace / memory isolation
+    workspace: Optional[str] = None,
+    memory_dir: Optional["Path"] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -222,7 +226,9 @@ def _build_child_agent(
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
         skip_context_files=True,
-        skip_memory=True,
+        skip_memory=not bool(workspace or memory_dir),
+        memory_dir=memory_dir,
+        workspace=workspace,
         clarify_callback=None,
         session_db=getattr(parent_agent, '_session_db', None),
         providers_allowed=parent_agent.providers_allowed,
@@ -401,6 +407,8 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    workspace: Optional[str] = None,
+    memory_dir: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -444,7 +452,8 @@ def delegate_task(
     if tasks and isinstance(tasks, list):
         task_list = tasks[:MAX_CONCURRENT_CHILDREN]
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        task_list = [{"goal": goal, "context": context, "toolsets": toolsets,
+                      "workspace": workspace, "memory_dir": memory_dir}]
     else:
         return json.dumps({"error": "Provide either 'goal' (single task) or 'tasks' (batch)."})
 
@@ -482,6 +491,8 @@ def delegate_task(
                 override_provider=creds["provider"], override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
+                workspace=t.get("workspace") or workspace,
+                memory_dir=Path(t["memory_dir"]) if t.get("memory_dir") else (Path(memory_dir) if memory_dir else None),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -747,6 +758,20 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Toolsets for this specific task",
                         },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Workspace name for this task's subagent. "
+                                "Overrides the top-level workspace parameter for this task only."
+                            ),
+                        },
+                        "memory_dir": {
+                            "type": "string",
+                            "description": (
+                                "Custom memory directory for this task's subagent. "
+                                "Overrides top-level memory_dir for this task only."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -762,6 +787,23 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Max tool-calling turns per subagent (default: 50). "
                     "Only set lower for simple tasks."
+                ),
+            },
+            "workspace": {
+                "type": "string",
+                "description": (
+                    "Workspace name for this subagent's memory. "
+                    "Maps to $HERMES_HOME/workspaces/{workspace}/memories/. "
+                    "When set, the subagent gets its own isolated memory store "
+                    "and can read/write memory entries without polluting the parent's."
+                ),
+            },
+            "memory_dir": {
+                "type": "string",
+                "description": (
+                    "Custom memory directory path for this subagent. "
+                    "Takes precedence over workspace. Use an absolute path. "
+                    "Example: /tmp/my-project-memory"
                 ),
             },
         },
@@ -783,7 +825,10 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
-        parent_agent=kw.get("parent_agent")),
+        workspace=args.get("workspace"),
+        memory_dir=args.get("memory_dir"),
+        parent_agent=kw.get("parent_agent"),
+    ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
 )

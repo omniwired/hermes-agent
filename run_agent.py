@@ -419,6 +419,8 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        memory_dir: Path | None = None,
+        workspace: str | None = None,
     ):
         """
         Initialize the AI Agent.
@@ -462,6 +464,12 @@ class AIAgent:
                 When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
             honcho_manager: Optional shared HonchoSessionManager owned by the caller.
             honcho_config: Optional HonchoClientConfig corresponding to honcho_manager.
+            memory_dir (Path): Custom directory for memory files (MEMORY.md, USER.md).
+                When set, MemoryStore uses this path instead of $HERMES_HOME/memories/.
+                Takes precedence over workspace when both are set.
+            workspace (str): Workspace name for this agent. Maps to
+                $HERMES_HOME/workspaces/{workspace}/memories/. When set, enables
+                per-agent/per-project memory isolation. Mutually exclusive with memory_dir.
         """
         _install_safe_stdio()
 
@@ -900,6 +908,16 @@ class AIAgent:
         except Exception:
             _agent_cfg = {}
 
+        # Resolve per-agent memory directory from workspace or explicit parameter
+        # Must be set before the MemoryStore initialization below.
+        if memory_dir is not None:
+            self._memory_dir: Path | None = memory_dir
+        elif workspace is not None:
+            hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+            self._memory_dir = hermes_home / "workspaces" / workspace / "memories"
+        else:
+            self._memory_dir = None
+
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -920,6 +938,7 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_dir=self._memory_dir,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -950,7 +969,7 @@ class AIAgent:
                     self._honcho_config = hcfg
                     if self._honcho_should_activate(hcfg):
                         from honcho_integration.session import HonchoSessionManager
-                        client = get_honcho_client(hcfg)
+                        client = get_honcho_client(hcfg, workspace_id=workspace)
                         self._honcho = HonchoSessionManager(
                             honcho=client,
                             config=hcfg,
@@ -7394,8 +7413,181 @@ def main(
             print(f"\n💾 Sample trajectory saved to: {sample_filename}")
         except Exception as e:
             print(f"\n⚠️ Failed to save sample: {e}")
-    
+
     print("\n👋 Agent execution completed!")
+
+
+# ---------------------------------------------------------------------------
+# Master Agent -- head of operations with per-project memory workspaces
+# ---------------------------------------------------------------------------
+
+import contextvars
+
+# Thread-local storage so tools can find the current MasterAIAgent instance.
+_current_master_agent: contextvars.ContextVar["MasterAIAgent | None"] = contextvars.ContextVar(
+    "_current_master_agent", default=None
+)
+
+
+class MasterAIAgent(AIAgent):
+    """
+    Head agent that oversees all operations and manages per-project memory workspaces.
+
+    MasterAIAgent is a specialized AIAgent that:
+    - Tracks which workspace is assigned to each named project
+    - Provides explicit workspace assignment via register_workspace()
+    - Spawns child agents with the correct workspace for their project
+    - Maintains full memory isolation between projects
+
+    Usage:
+        master = MasterAIAgent(workspace="master")
+
+        # Register workspaces for your projects
+        master.register_workspace("hermes", "hermes-core")
+        master.register_workspace("my-app", "my-app-agent")
+
+        # Delegate tasks with explicit workspace assignment
+        master.delegate_task(goal="Analyze the hermes codebase", workspace="hermes")
+        master.delegate_task(goal="Review API design", workspace="my-app")
+
+        # Each project agent gets its own isolated memory at:
+        #   $HERMES_HOME/workspaces/hermes-core/memories/
+        #   $HERMES_HOME/workspaces/my-app-agent/memories/
+    """
+
+    def __init__(self, *args, **kwargs):
+        if "workspace" not in kwargs and "memory_dir" not in kwargs:
+            kwargs["workspace"] = "master"
+        super().__init__(*args, **kwargs)
+        self._project_workspace_registry: dict[str, str] = {}
+        self._project_agents: dict[str, AIAgent] = {}
+        from concurrent.futures import ThreadPoolExecutor
+        self._project_pools: dict[str, ThreadPoolExecutor] = {}
+        self._master_token = _current_master_agent.set(self)
+
+    def register_workspace(self, project: str, workspace: str) -> None:
+        """Register that a named project should use a specific workspace."""
+        self._project_workspace_registry[project] = workspace
+        hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+        ws_dir = hermes_home / "workspaces" / workspace / "memories"
+        ws_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_workspace(self, project: str) -> str | None:
+        return self._project_workspace_registry.get(project)
+
+    def list_projects(self) -> dict[str, str]:
+        return dict(self._project_workspace_registry)
+
+    def register_agent(self, project: str, agent: AIAgent,
+                      max_workers: int = 1) -> None:
+        """Register a persistent AIAgent for a project with a thread pool."""
+        from concurrent.futures import ThreadPoolExecutor
+        self._project_agents[project] = agent
+        self._project_pools[project] = ThreadPoolExecutor(max_workers=max_workers)
+
+    def unregister_agent(self, project: str) -> None:
+        """Remove a project's agent and shut down its thread pool."""
+        pool = self._project_pools.pop(project, None)
+        if pool:
+            pool.shutdown(wait=False)
+        self._project_agents.pop(project, None)
+
+    def get_agent(self, project: str) -> AIAgent | None:
+        return self._project_agents.get(project)
+
+    def list_agents(self) -> dict[str, AIAgent]:
+        return dict(self._project_agents)
+
+    def delegate_task(self, goal: str, project: str | None = None,
+                      workspace: str | None = None,
+                      context: str | None = None, toolsets: list[str] | None = None,
+                      tasks: list[dict] | None = None,
+                      max_iterations: int | None = None) -> str:
+        """Delegate with project routing: registered agent → persistent pool, else ephemeral child."""
+        import json
+
+        if project and project in self._project_agents:
+            agent = self._project_agents[project]
+            pool = self._project_pools.get(project)
+            result_holder: list = [None]
+            exc_holder: list = [None]
+            timeout_seconds = (max_iterations or 90) * 30
+
+            system_parts = [
+                "You are a focused subagent working on a specific delegated task.",
+                f"YOUR TASK:\n{goal}",
+            ]
+            if context:
+                system_parts.append(f"\nCONTEXT:\n{context}")
+            system_parts.append(
+                "\nWhen finished, provide a clear summary of what you did, "
+                "what you found, files modified, and any issues."
+            )
+            system_msg = "\n".join(system_parts)
+
+            def run_agent():
+                try:
+                    result = agent.run_conversation(
+                        user_message="Please complete the task described above.",
+                        system_message=system_msg,
+                    )
+                    response = result.get("response", str(result))
+                    result_holder[0] = json.dumps({
+                        "status": "completed",
+                        "summary": response,
+                        "response": result,
+                    }, ensure_ascii=False)
+                except Exception as e:
+                    exc_holder[0] = e
+
+            future = pool.submit(run_agent)
+            try:
+                result_holder[0] = future.result(timeout=timeout_seconds)
+            except TimeoutError:
+                return json.dumps({
+                    "status": "timeout",
+                    "error": f"Agent did not respond within {timeout_seconds}s "
+                              f"(project={project}, pool max_workers={pool._max_workers})",
+                })
+            if exc_holder[0]:
+                return json.dumps({
+                    "status": "error",
+                    "error": str(exc_holder[0]),
+                })
+            return result_holder[0] or json.dumps({"status": "error", "error": "no result"})
+
+        effective_workspace = workspace or (self.get_workspace(project) if project else None)
+        return self._delegate_ephemeral(
+            goal=goal, workspace=effective_workspace,
+            context=context, toolsets=toolsets, tasks=tasks, max_iterations=max_iterations,
+        )
+
+    def _delegate_ephemeral(self, goal: str, workspace: str | None = None,
+                            context: str | None = None, toolsets: list[str] | None = None,
+                            tasks: list[dict] | None = None,
+                            max_iterations: int | None = None) -> str:
+        from tools.delegate_tool import delegate_task as _delegate_task
+        return _delegate_task(
+            goal=goal, context=context, toolsets=toolsets, tasks=tasks,
+            max_iterations=max_iterations, workspace=workspace, parent_agent=self,
+        )
+
+    def run_conversation(self, *args, **kwargs):
+        """Wrap parent run_conversation to keep thread-local master agent in scope."""
+        token = self._master_token
+        try:
+            return super().run_conversation(*args, **kwargs)
+        finally:
+            _current_master_agent.reset(token)
+
+
+def get_master_agent() -> MasterAIAgent | None:
+    """Return the current MasterAIAgent from thread-local storage, or None."""
+    return _current_master_agent.get()
+
+
+# Import master_tools to register manage_project tool.
+import tools.master_tools  # noqa: F401
 
 
 if __name__ == "__main__":
